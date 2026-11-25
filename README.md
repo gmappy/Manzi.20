@@ -37,3 +37,7 @@ Set an item's **Type** to *3D model* in the admin. It stands on one of 9 pedesta
 - Any static host works (GitHub Pages, S3, Cloudflare Pages).
 
 Three.js r128 loads from cdnjs. If it or WebGL is unavailable, the gallery falls back to a 2D list of the exhibition. Curation is per-browser; exhibitions are shared through exported JSON.
+
+
+## Realistic architecture update
+The gallery now uses procedural PBR-style oak flooring and plaster wall maps, ACES filmic tone mapping, soft directional shadows, a glass roof lantern with bronze mullions, warm architectural lighting, and recessed ceiling fixtures. The original floor plan, navigation, artwork placement, curator workflow, exhibition data, and guided tour remain intact. The 27.9 MB reference GLB was used as a visual guide for its wood, concrete, glass, and architectural material treatment; it is not loaded as a replacement shell because its coordinate system and room footprint differ from Aetheria's walkable floor plan.

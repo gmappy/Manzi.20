@@ -108,15 +108,29 @@
   let renderer;
   try { renderer = new THREE.WebGLRenderer({ canvas: $('c'), antialias: true }); } catch (e) { return fallback('WebGL is not available in this browser.'); }
   renderer.outputEncoding = THREE.sRGBEncoding;
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.12;
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
   /* ---------- Scene ---------- */
   const scene = new THREE.Scene(), camera = new THREE.PerspectiveCamera(70, 1, .1, 400);
   camera.rotation.order = 'YXZ';
   const cam = { pos: new THREE.Vector3(0, EYE, 4), yaw: 0, pitch: 0 };
-  const hemi = new THREE.HemisphereLight(0xffffff, 0x6b5a50, .6); scene.add(hemi);
-  const sun = new THREE.DirectionalLight(0xffffff, 1); scene.add(sun);
+  const hemi = new THREE.HemisphereLight(0xfff3e4, 0x51443b, .72); scene.add(hemi);
+  const sun = new THREE.DirectionalLight(0xffffff, 1);
+  sun.castShadow = true;
+  sun.shadow.mapSize.set(1024, 1024);
+  sun.shadow.camera.left = -38; sun.shadow.camera.right = 38;
+  sun.shadow.camera.top = 38; sun.shadow.camera.bottom = -38;
+  sun.shadow.bias = -0.00025;
+  scene.add(sun);
   const lamps = [];
-  function lamp(x, z, y, range) { const l = new THREE.PointLight(0xffe2c0, .7, range, 1.6); l.position.set(x, y, z); scene.add(l); lamps.push(l); }
+  function lamp(x, z, y, range) { const l = new THREE.PointLight(0xffe2c0, .85, range, 1.35);
+    l.position.set(x, y, z);
+    scene.add(l); lamps.push(l);
+    const glow = new THREE.Mesh(new THREE.SphereGeometry(.12,12,8), new THREE.MeshBasicMaterial({color:0xffe2c0}));
+    glow.position.copy(l.position); world.add(glow); }
 
   // Sky dome (vertical gradient) + sun disc + stars
   const skyMat = new THREE.ShaderMaterial({ side: THREE.BackSide, depthWrite: false,
@@ -147,10 +161,44 @@
 
   /* ---------- Architecture ---------- */
   const M = (c, o) => new THREE.MeshStandardMaterial(Object.assign({ color: c, roughness: .85 }, o || {}));
-  const wallM = M(0xE2A894, { side: THREE.DoubleSide }), roomM = M(0xf1e9dd, { side: THREE.DoubleSide }), ceilM = M(0xf6efe6, { side: THREE.DoubleSide }), trimM = M(0xf3e7da, { roughness: .6 }), floorM = M(0xcdb59b, { roughness: .55 }), woodM = M(0xa57c52, { roughness: .45 }), goldM = M(0xb88a5a, { metalness: .6, roughness: .35 }), darkM = M(0x3b2a22, { roughness: .6 });
+  // Small seamless procedural PBR maps give the architecture tactile finishes without external assets.
+  function surface(kind, repeatX, repeatY) {
+    const c = document.createElement('canvas'); c.width = c.height = 512;
+    const x = c.getContext('2d');
+    if (kind === 'oak') {
+      x.fillStyle = '#b58b60'; x.fillRect(0,0,512,512);
+      for (let y=0;y<512;y+=64) {
+        x.fillStyle = y%128 ? '#a77b50' : '#c49a6c'; x.fillRect(0,y,512,62);
+        x.strokeStyle='rgba(66,39,20,.25)'; x.lineWidth=2; x.strokeRect(0,y,512,62);
+        for(let k=0;k<42;k++){const xx=Math.random()*512, yy=y+Math.random()*60;
+          x.strokeStyle=`rgba(75,43,23,${.035+Math.random()*.09})`; x.lineWidth=1+Math.random()*2;
+          x.beginPath(); x.moveTo(xx,yy); x.bezierCurveTo(xx+35,yy-5,xx+65,yy+5,xx+110,yy); x.stroke();}
+      }
+      for(let y=0;y<512;y+=128) x.fillStyle='rgba(45,25,12,.28)',x.fillRect(0,y,512,2);
+    } else if (kind === 'plaster' || kind === 'concrete') {
+      x.fillStyle = kind === 'plaster' ? '#dfc7b7' : '#b7b2aa'; x.fillRect(0,0,512,512);
+      for(let i=0;i<19000;i++){const v=Math.random(), a=.025+Math.random()*.09;
+        x.fillStyle=v>.5?`rgba(255,255,255,${a})`:`rgba(40,30,25,${a})`;
+        const xx=Math.random()*512, yy=Math.random()*512, r=1+Math.random()*2;
+        x.fillRect(xx,yy,r,r);}
+    }
+    const t = new THREE.CanvasTexture(c); t.wrapS=t.wrapT=THREE.RepeatWrapping;
+    t.repeat.set(repeatX,repeatY); t.anisotropy=Math.min(8,renderer.capabilities.getMaxAnisotropy());
+    t.encoding=THREE.sRGBEncoding; return t;
+  }
+  const oakMap=surface('oak',3,5), plasterMap=surface('plaster',2,2), concreteMap=surface('concrete',3,3);
+  const wallM = M(0xffffff, { map: plasterMap, side: THREE.DoubleSide, roughness: .94 }),
+    roomM = M(0xffffff, { map: plasterMap, side: THREE.DoubleSide, roughness: .92 }),
+    ceilM = M(0xf6efe6, { roughness: .88 }),
+    trimM = M(0xf3e7da, { roughness: .58 }),
+    floorM = M(0xffffff, { map: oakMap, roughness: .68 }),
+    woodM = M(0xffffff, { map: oakMap, roughness: .5 }),
+    goldM = M(0xb88a5a, { metalness: .72, roughness: .28 }),
+    darkM = M(0x3b2a22, { roughness: .62 });
   const skyLit = new THREE.MeshBasicMaterial({ color: 0xffffff }), lightM = new THREE.MeshBasicMaterial({ color: 0xfff4de }), fixed = []; // fixed = furniture collision circles
   const world = new THREE.Group(); scene.add(world);
-  const put = (g, m, x, y, z, p) => { const o = new THREE.Mesh(g, m); o.position.set(x, y, z); (p || world).add(o); return o; };
+  const put = (g, m, x, y, z, p) => { const o = new THREE.Mesh(g, m); o.position.set(x, y, z);
+    o.castShadow = true; o.receiveShadow = true; (p || world).add(o); return o; };
   const box = (sx, sy, sz, m, x, y, z, p) => put(new THREE.BoxGeometry(sx, sy, sz), m, x, y, z, p);
   const flat = (w, d, m, x, y, z, p, up) => { const o = put(new THREE.PlaneGeometry(w, d), m, x, y, z, p); o.rotation.x = up ? -Math.PI / 2 : Math.PI / 2; return o; };
   const ground = put(new THREE.PlaneGeometry(600, 600), M(0x39423a), 0, -.05, 0); ground.rotation.x = -Math.PI / 2;
@@ -164,6 +212,15 @@
   const hc = put(new THREE.ShapeGeometry(sh), ceilM, 0, HH, 0); hc.rotation.x = Math.PI / 2;
   [-1, 1].forEach(s => { box(2 * sk + .2, .9, .12, trimM, 0, HH + .45, s * sk); box(.12, .9, 2 * sk + .2, trimM, s * sk, HH + .45, 0); });
   flat(2 * sk, 2 * sk, skyLit, 0, HH + .9, 0, world, false);
+  // Architectural roof lantern: bronze mullions and a subtle blue-tinted glass surface.
+  const glassM = new THREE.MeshPhysicalMaterial({color:0xb8d5df, metalness:.12, roughness:.12,
+    transparent:true, opacity:.22, transmission:.45, thickness:.08, side:THREE.DoubleSide, depthWrite:false});
+  const skylight = new THREE.Mesh(new THREE.PlaneGeometry(2*sk,2*sk),glassM);
+  skylight.rotation.x=Math.PI/2; skylight.position.set(0,HH+.92,0); world.add(skylight);
+  for(let i=-2;i<=2;i++){
+    box(.045,.055,2*sk, goldM, i*sk/2, HH+.95, 0);
+    box(2*sk,.055,.045, goldM, 0, HH+.95, i*sk/2);
+  }
   for (let k = 0; k < 4; k++) {
     const phi = k * Math.PI / 2, dx = Math.round(Math.sin(phi)), dz = Math.round(Math.cos(phi)), cz = D0 + DP / 2, ez = D0 + DP;
     const w = new THREE.Group(); w.rotation.y = phi; world.add(w); // local +z points outward from the hall
@@ -188,6 +245,17 @@
     lamp(dx * (D0 + 4), dz * (D0 + 4), RH - .6, 13); lamp(dx * (D0 + 10), dz * (D0 + 10), RH - .6, 13);
   }
   lamp(0, 0, HH - .8, 26);
+  // Recessed ceiling downlights and bronze trim rings in each wing.
+  for(let k=0;k<4;k++){
+    const phi=k*Math.PI/2, dx=Math.round(Math.sin(phi)), dz=Math.round(Math.cos(phi));
+    for(let j=0;j<3;j++){
+      const d=D0+3.5+j*4.2, x=dx*d, z=dz*d;
+      const fixture=new THREE.Mesh(new THREE.CylinderGeometry(.19,.23,.055,24),goldM);
+      fixture.position.set(x,RH-.06,z); world.add(fixture);
+      const diffuser=new THREE.Mesh(new THREE.CircleGeometry(.15,24),new THREE.MeshBasicMaterial({color:0xffedcf}));
+      diffuser.rotation.x=Math.PI/2; diffuser.position.set(x,RH-.025,z); world.add(diffuser);
+    }
+  }
   const blockers = [], spinners = []; // pedestal collision circles and turntable groups
 
   /* ---------- Artworks ---------- */
@@ -220,6 +288,7 @@
     return g;
   }
   function fitModel(obj) { // scale to ~1.6 units, centre on x/z, sit on the pedestal
+    obj.traverse(n => { if(n.isMesh){n.castShadow=true;n.receiveShadow=true;} });
     const b = new THREE.Box3().setFromObject(obj), sz = b.getSize(new THREE.Vector3()), c = b.getCenter(new THREE.Vector3()), k = 1.6 / Math.max(sz.x, sz.y, sz.z, 1e-3);
     obj.scale.multiplyScalar(k); obj.position.set(-c.x * k, -b.min.y * k, -c.z * k); const g = new THREE.Group(); g.add(obj); return g;
   }
