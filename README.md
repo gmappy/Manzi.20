@@ -19,7 +19,7 @@ Visitors see `exhibition.json` (shipped with the site). The admin edits a privat
 1. Open `admin.html`, curate, and check it with **Preview draft**.
 2. Click **Publish: download exhibition.json**, replace `exhibition.json` in the project, and redeploy.
 
-**Password:** on first open, `admin.html` asks you to create a curator password and shows one line to paste into `admin-config.js`; do that before deploying so it works on every device. This gate is client-side (a salted PBKDF2 hash): it keeps people out of the curator UI but is not server security. Use your host's access control on `/admin.html` for hard protection. Forgot it? Clear `admin-config.js` and site storage to set a new one.
+**Password:** `admin-config.js` is intentionally shipped with an empty hash. On first open, `admin.html` asks you to create a curator password and shows one line to paste into `admin-config.js`; replace the empty line with that generated hash before deploying so it works on every device. This gate is client-side (a salted PBKDF2 hash): it keeps people out of the curator UI but is not server security. Use your host's access control on `/admin.html` for hard protection. Forgot it? Clear `admin-config.js` and site storage to set a new one.
 
 The admin is not linked from the gallery. Exposing it is harmless: a visitor's edits only affect their own browser. Protect it with your host's password feature or leave it out of the deploy if you prefer.
 
@@ -39,5 +39,17 @@ Set an item's **Type** to *3D model* in the admin. It stands on one of 9 pedesta
 Three.js r128 loads from cdnjs. If it or WebGL is unavailable, the gallery falls back to a 2D list of the exhibition. Curation is per-browser; exhibitions are shared through exported JSON.
 
 
-## Realistic architecture update
-The gallery now uses procedural PBR-style oak flooring and plaster wall maps, ACES filmic tone mapping, soft directional shadows, a glass roof lantern with bronze mullions, warm architectural lighting, and recessed ceiling fixtures. The original floor plan, navigation, artwork placement, curator workflow, exhibition data, and guided tour remain intact. The 27.9 MB reference GLB was used as a visual guide for its wood, concrete, glass, and architectural material treatment; it is not loaded as a replacement shell because its coordinate system and room footprint differ from Aetheria's walkable floor plan.
+## Realistic architecture and performance update
+The central salon now uses a procedural polished-stone finish with brass inlay; the four wings retain warm oak flooring and textured plaster. The glass roof lantern, bronze mullions, recessed ceiling fixtures, framed wall bays and warm sconces add architectural detail. ACES filmic tone mapping and procedural surface maps remain in place.
+
+Mobile devices use a lower rendering pixel ratio, disable expensive real-time shadows, and refresh the minimap less often. Rendering pauses while the page is hidden. Desktop retains soft shadows. The original floor plan, navigation, artwork placement, curator workflow, exhibition data, and guided tour remain intact.
+
+The supplied 27.9 MB GLB has been inspected: its bounds are approximately 31.9 × 17.5 × 31.9 units. It is not inserted as the building shell because its geometry and vertical scale do not match the existing walkable floor plan. The gallery continues to load individual artwork GLBs through its existing curator workflow. A proper shell replacement requires a deliberate coordinate and collision/navigation remap, not simply dropping the model into the scene.
+
+## Release notes — premium build
+- The gallery runs as a static site: no server runtime or build command is required.
+- Artwork without an image now receives generated artwork safely (including newly-created curator entries).
+- Curator preview rebuilds dispose artwork GPU resources to reduce memory growth during repeated edits.
+- The supplied 27.9 MB `vr_gallery_for_product_showcase_2020.glb` is a separate room/showcase asset, not a drop-in replacement for this gallery's four-wing floor plan. It is intentionally not wired in as the building shell: doing so without remapping the floor plan, scale, doors, and collision system would break navigation. Individual artwork GLBs remain supported through the curator workflow.
+- Before publishing, configure the curator password and protect `/admin.html` with host-level access control if the admin area must be private.
+- Verify the deployed URL on an Android phone and a desktop browser. WebGL and the Three.js CDN are required for the 3D view; a 2D exhibition list is shown if WebGL cannot start.

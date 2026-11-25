@@ -106,12 +106,14 @@
   }
   if (!window.THREE) return fallback('The 3D library could not be loaded.');
   let renderer;
-  try { renderer = new THREE.WebGLRenderer({ canvas: $('c'), antialias: true }); } catch (e) { return fallback('WebGL is not available in this browser.'); }
+  const isMobile = matchMedia('(max-width: 760px), (pointer: coarse)').matches;
+  try { renderer = new THREE.WebGLRenderer({ canvas: $('c'), antialias: !isMobile, powerPreference: 'high-performance', alpha: false }); } catch (e) { return fallback('WebGL is not available in this browser.'); }
   renderer.outputEncoding = THREE.sRGBEncoding;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
-  renderer.toneMappingExposure = 1.12;
-  renderer.shadowMap.enabled = true;
+  renderer.toneMappingExposure = isMobile ? 1.06 : 1.12;
+  renderer.shadowMap.enabled = !isMobile;
   renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  renderer.setPixelRatio(Math.min(devicePixelRatio || 1, isMobile ? 1.35 : 1.8));
 
   /* ---------- Scene ---------- */
   const scene = new THREE.Scene(), camera = new THREE.PerspectiveCamera(70, 1, .1, 400);
@@ -186,12 +188,25 @@
     t.repeat.set(repeatX,repeatY); t.anisotropy=Math.min(8,renderer.capabilities.getMaxAnisotropy());
     t.encoding=THREE.sRGBEncoding; return t;
   }
-  const oakMap=surface('oak',3,5), plasterMap=surface('plaster',2,2), concreteMap=surface('concrete',3,3);
+  function marbleSurface() {
+    const c=document.createElement('canvas'); c.width=c.height=512; const x=c.getContext('2d');
+    x.fillStyle='#d8d1c6'; x.fillRect(0,0,512,512);
+    for(let i=0;i<18;i++){
+      const y=Math.random()*512, amp=8+Math.random()*24, freq=.008+Math.random()*.018;
+      x.beginPath(); x.moveTo(0,y);
+      for(let xx=0;xx<=512;xx+=4) x.lineTo(xx,y+Math.sin(xx*freq+i)*amp+Math.sin(xx*freq*.37+i*2)*amp*.45);
+      x.strokeStyle=i%3===0?'rgba(255,255,255,.42)':'rgba(116,105,92,.16)'; x.lineWidth=1+Math.random()*2; x.stroke();
+    }
+    for(let i=0;i<7000;i++){const a=.012+Math.random()*.025;x.fillStyle=`rgba(80,70,60,${a})`;x.fillRect(Math.random()*512,Math.random()*512,1,1);}
+    const t=new THREE.CanvasTexture(c); t.wrapS=t.wrapT=THREE.RepeatWrapping; t.repeat.set(2.4,2.4); t.anisotropy=Math.min(8,renderer.capabilities.getMaxAnisotropy()); t.encoding=THREE.sRGBEncoding; return t;
+  }
+  const oakMap=surface('oak',3,5), plasterMap=surface('plaster',2,2), concreteMap=surface('concrete',3,3), marbleMap=marbleSurface();
   const wallM = M(0xffffff, { map: plasterMap, side: THREE.DoubleSide, roughness: .94 }),
     roomM = M(0xffffff, { map: plasterMap, side: THREE.DoubleSide, roughness: .92 }),
     ceilM = M(0xf6efe6, { roughness: .88 }),
     trimM = M(0xf3e7da, { roughness: .58 }),
     floorM = M(0xffffff, { map: oakMap, roughness: .68 }),
+    marbleM = M(0xffffff, { map: marbleMap, roughness: .27, metalness: .06 }),
     woodM = M(0xffffff, { map: oakMap, roughness: .5 }),
     goldM = M(0xb88a5a, { metalness: .72, roughness: .28 }),
     darkM = M(0x3b2a22, { roughness: .62 });
@@ -203,7 +218,10 @@
   const flat = (w, d, m, x, y, z, p, up) => { const o = put(new THREE.PlaneGeometry(w, d), m, x, y, z, p); o.rotation.x = up ? -Math.PI / 2 : Math.PI / 2; return o; };
   const ground = put(new THREE.PlaneGeometry(600, 600), M(0x39423a), 0, -.05, 0); ground.rotation.x = -Math.PI / 2;
   // Central hall: floor, gold inlay, ceiling with a roof lantern (skylight), trim
-  flat(2 * HS + .6, 2 * HS + .6, floorM, 0, 0, 0, world, true);
+  flat(2 * HS + .6, 2 * HS + .6, marbleM, 0, 0, 0, world, true);
+  // Double brass perimeter lines and a quiet stone border define the central salon.
+  const salonLine = M(0x9b744b,{metalness:.62,roughness:.32});
+  [HS-1.15,HS-1.32].forEach(r=>{ const ln=put(new THREE.RingGeometry(r,r+.025,4,1,Math.PI/4),salonLine,0,.018,0); ln.rotation.x=-Math.PI/2; });
   const ring = put(new THREE.RingGeometry(2.6, 2.9, 64), goldM, 0, .01, 0); ring.rotation.x = -Math.PI / 2;
   const sq = put(new THREE.RingGeometry((HS - 1.5) * 1.4142, (HS - 1.3) * 1.4142, 4, 1, Math.PI / 4), goldM, 0, .01, 0); sq.rotation.x = -Math.PI / 2;
   const q = HS + T, sk = 3.2, sh = new THREE.Shape(), hole = new THREE.Path();
@@ -273,7 +291,11 @@
   function loadTex(it, cb) {
     const fromImg = im => { const t = new THREE.Texture(im); t.encoding = THREE.sRGBEncoding; t.anisotropy = 4; t.needsUpdate = true; cb(t, im.width / im.height); };
     const gen = () => fromImg(A.genArt(A.hash(it.id)));
-    if (!it.image || it.image.indexOf('gen:') === 0) return fromImg(A.genArt(+it.image.slice(4) || A.hash(it.id)));
+    // Empty image values are valid for newly-created artwork; do not call slice() on null/empty.
+    if (!it.image || it.image.indexOf('gen:') === 0) {
+      const seed = it.image ? (+it.image.slice(4) || A.hash(it.id)) : A.hash(it.id);
+      return fromImg(A.genArt(seed));
+    }
     const im = new Image(); im.crossOrigin = 'anonymous'; im.onload = () => fromImg(im); im.onerror = gen; im.src = it.image;
   }
   /* ---------- 3D works: built-in shapes or GLB files on pedestals ---------- */
@@ -309,7 +331,24 @@
     loadModel(it, obj => { if (my !== buildGen) return; const g = new THREE.Group(); g.add(obj); g.position.set(x, 1.05, z); artRoot.add(g); spinners.push(g); });
   }
   function buildArt() {
-    while (artRoot.children.length) artRoot.remove(artRoot.children[0]);
+    // Dispose artwork-only GPU resources before rebuilding a curator preview.
+    while (artRoot.children.length) {
+      const child = artRoot.children[0];
+      child.traverse(n => {
+        if (n.geometry) n.geometry.dispose();
+        if (n.material) {
+          const mats = Array.isArray(n.material) ? n.material : [n.material];
+          mats.forEach(m => {
+            ['map', 'emissiveMap', 'normalMap', 'roughnessMap', 'metalnessMap', 'alphaMap'].forEach(k => {
+              if (m[k] && m[k].dispose) m[k].dispose();
+            });
+            // Some gallery materials (for example trimM) are shared with architecture;
+            // leave material disposal to the scene lifetime and release only owned textures.
+          });
+        }
+      });
+      artRoot.remove(child);
+    }
     arts = []; pics = []; blockers.length = 0; spinners.length = 0; buildGen++;
     state.items.forEach(it => {
       const s = A.slot(it.slot); if (!s) return;
@@ -493,11 +532,14 @@
   ['click', 'keydown', 'touchend'].forEach(n => addEventListener(n, kick)); syncMusic();
 
   /* ---------- Main loop ---------- */
-  function resize() { renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 2)); renderer.setSize(innerWidth, innerHeight); camera.aspect = innerWidth / innerHeight; camera.fov = camera.aspect < 1 ? 82 : 68; camera.updateProjectionMatrix(); }
+  function resize() { renderer.setPixelRatio(Math.min(devicePixelRatio || 1, isMobile ? 1.35 : 1.8)); renderer.setSize(innerWidth, innerHeight); camera.aspect = innerWidth / innerHeight; camera.fov = camera.aspect < 1 ? 82 : 68; camera.updateProjectionMatrix(); }
   addEventListener('resize', resize); resize();
   if (PREVIEW) addEventListener('storage', e => { if (e.key === A.KEY) { state = A.load(); setCur(null); buildArt(); } });
-  let last = performance.now(), frame = 0, pickT = 0;
+  let last = performance.now(), frame = 0, pickT = 0, mapTick = 0;
+  let pageVisible = !document.hidden;
+  document.addEventListener('visibilitychange',()=>{pageVisible=!document.hidden;last=performance.now();if(pageVisible)requestAnimationFrame(loop);});
   function loop(now) {
+    if(!pageVisible) return;
     requestAnimationFrame(loop); const dt = Math.min(.05, (now - last) / 1000); last = now; frame++;
     const mv = keys.f - keys.b, st = keys.r - keys.l, tr = keys.tr - keys.tl;
     if (mv || st || tr) { if (tw) { tw = null; } playing = false; updTour(); }
@@ -514,7 +556,7 @@
       ray.setFromCamera(new THREE.Vector2(0, 0), camera); const h = ray.intersectObjects(pics)[0];
       if (h && h.distance < 12) setCur(h.object.userData.art); else if (cur && cur.pos.distanceTo(cam.pos) > 8) setCur(null); }
     if (frame % 60 === 1) { applyTime(curH()); showClock(); }
-    if (frame % 2 === 0 && !mapOff) drawMap();
+    if (!mapOff && (++mapTick % (isMobile ? 5 : 2) === 0)) drawMap();
     renderer.render(scene, camera);
   }
   hr.value = nowH(); applyTime(nowH()); showClock(); requestAnimationFrame(loop);
