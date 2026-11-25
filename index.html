@@ -412,14 +412,21 @@
 
   /* ---------- Voice chat (WebRTC audio mesh, signaling over existing WS / BroadcastChannel) ---------- */
   const voicePcs = new Map();          // peerId -> RTCPeerConnection
+  const voiceMakingOffer = new Map();  // peerId -> bool (glare guard)
   const voiceStreams = new Map();      // peerId -> MediaStream (remote)
   let localStream = null;
   let micEnabled = false;
   let voiceStarting = false;
+  let audioUnlocked = false;
   const ICE_SERVERS = [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' }
   ];
+
+  // Deterministic initiator: lower id string becomes the offerer (avoids glare)
+  function isPolite(peerId) {
+    return String(self.id) < String(peerId);
+  }
 
   function updateMicUI() {
     const btn = $('mic-btn');
@@ -434,7 +441,24 @@
   }
 
   function sendSignal(to, data) {
-    sendPacket({ type: 'signal', to, data });
+    // Always include from so BroadcastChannel path works cleanly
+    sendPacket({ type: 'signal', to, from: self.id, data });
+  }
+
+  // Unlock audio playback (browser autoplay policy) — must be called from a user gesture
+  function unlockAudio() {
+    if (audioUnlocked) return;
+    try {
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      if (ctx.state === 'suspended') ctx.resume();
+      // Tiny silent buffer
+      const buf = ctx.createBuffer(1, 1, 22050);
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      src.connect(ctx.destination);
+      src.start(0);
+      audioUnlocked = true;
+    } catch (e) {}
   }
 
   async function ensureLocalStream() {
@@ -460,10 +484,31 @@
     }
   }
 
+  function ensureAudioEl(peerId) {
+    let audio = document.getElementById('voice-audio-' + peerId);
+    if (!audio) {
+      audio = document.createElement('audio');
+      audio.id = 'voice-audio-' + peerId;
+      audio.autoplay = true;
+      audio.playsInline = true;
+      audio.setAttribute('playsinline', '');
+      audio.style.display = 'none';
+      document.body.appendChild(audio);
+    }
+    return audio;
+  }
+
   function createVoicePc(peerId) {
     if (voicePcs.has(peerId)) return voicePcs.get(peerId);
     const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
     voicePcs.set(peerId, pc);
+    voiceMakingOffer.set(peerId, false);
+    pc._pendingIce = [];
+
+    // Always have an audio transceiver so we can receive even before mic is on
+    try {
+      pc.addTransceiver('audio', { direction: micEnabled && localStream ? 'sendrecv' : 'recvonly' });
+    } catch (e) {}
 
     pc.onicecandidate = (ev) => {
       if (ev.candidate) {
@@ -472,93 +517,162 @@
     };
 
     pc.ontrack = (ev) => {
-      const stream = ev.streams[0] || new MediaStream([ev.track]);
+      const stream = ev.streams && ev.streams[0] ? ev.streams[0] : new MediaStream([ev.track]);
       voiceStreams.set(peerId, stream);
-      // Attach to a hidden audio element so it plays
-      let audio = document.getElementById('voice-audio-' + peerId);
-      if (!audio) {
-        audio = document.createElement('audio');
-        audio.id = 'voice-audio-' + peerId;
-        audio.autoplay = true;
-        audio.playsInline = true;
-        audio.style.display = 'none';
-        document.body.appendChild(audio);
-      }
+      const audio = ensureAudioEl(peerId);
       audio.srcObject = stream;
-      audio.play().catch(() => {});
+      const play = () => audio.play().catch(() => {});
+      play();
+      // Retry shortly in case of autoplay race
+      setTimeout(play, 200);
     };
 
     pc.onconnectionstatechange = () => {
       const state = pc.connectionState;
-      if (state === 'failed' || state === 'closed' || state === 'disconnected') {
-        // Soft cleanup; full remove happens on peer leave
-        if (state === 'failed') {
-          try { pc.restartIce(); } catch (e) {}
-        }
+      if (state === 'failed') {
+        try { pc.restartIce(); } catch (e) {}
       }
       updateMicUI();
     };
 
-    // Add local tracks if we already have mic
-    if (localStream) {
-      localStream.getTracks().forEach(track => {
-        try { pc.addTrack(track, localStream); } catch (e) {}
+    // If we already have mic, attach tracks
+    if (localStream && micEnabled) {
+      localStream.getAudioTracks().forEach(track => {
+        const sender = pc.getSenders().find(s => s.track && s.track.kind === 'audio');
+        if (sender) {
+          sender.replaceTrack(track).catch(() => {
+            try { pc.addTrack(track, localStream); } catch (e) {}
+          });
+        } else {
+          try { pc.addTrack(track, localStream); } catch (e) {}
+        }
+      });
+      // Prefer sendrecv
+      pc.getTransceivers().forEach(t => {
+        if (t.receiver && t.receiver.track && t.receiver.track.kind === 'audio') {
+          try { t.direction = 'sendrecv'; } catch (e) {}
+        }
       });
     }
 
     return pc;
   }
 
-  async function startCallWith(peerId, isInitiator) {
+  async function maybeMakeOffer(peerId) {
+    // Rule: the peer with the *smaller* id creates the offer (when its mic is on).
+    // The higher-id peer only answers.
     if (!micEnabled || !localStream) return;
+    if (String(self.id) > String(peerId)) {
+      // We are the higher id → wait for the other side to offer
+      createVoicePc(peerId);
+      return;
+    }
+    // We are initiator (lower id)
     const pc = createVoicePc(peerId);
-    if (isInitiator) {
-      try {
-        const offer = await pc.createOffer({ offerToReceiveAudio: true });
-        await pc.setLocalDescription(offer);
-        sendSignal(peerId, { kind: 'offer', sdp: pc.localDescription });
-      } catch (e) {
-        console.warn('createOffer failed', e);
+    if (voiceMakingOffer.get(peerId)) return;
+    if (pc.signalingState !== 'stable') return;
+
+    try {
+      voiceMakingOffer.set(peerId, true);
+      pc.getTransceivers().forEach(t => {
+        if (t.receiver && t.receiver.track && t.receiver.track.kind === 'audio') {
+          try { t.direction = 'sendrecv'; } catch (e) {}
+        }
+      });
+      const offer = await pc.createOffer();
+      if (pc.signalingState !== 'stable') {
+        voiceMakingOffer.set(peerId, false);
+        return;
       }
+      await pc.setLocalDescription(offer);
+      sendSignal(peerId, { kind: 'offer', sdp: pc.localDescription });
+    } catch (e) {
+      console.warn('createOffer failed', peerId, e);
+    } finally {
+      voiceMakingOffer.set(peerId, false);
     }
   }
 
   async function handleSignal(from, data) {
     if (!data || !from || from === self.id) return;
+
     let pc = voicePcs.get(from);
-    if (!pc) {
-      // Incoming call — create PC even if we haven't enabled mic yet (so we can receive)
-      pc = createVoicePc(from);
-    }
+    if (!pc) pc = createVoicePc(from);
 
     try {
       if (data.kind === 'offer') {
-        await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
-        // If we have local stream, answer; otherwise still answer (receive-only)
-        if (localStream && micEnabled) {
-          localStream.getTracks().forEach(track => {
-            const already = pc.getSenders().some(s => s.track && s.track.id === track.id);
-            if (!already) {
-              try { pc.addTrack(track, localStream); } catch (e) {}
-            }
-          });
+        // Perfect negotiation-ish: if we are making an offer and we are the polite peer, roll back
+        const offerCollision = (voiceMakingOffer.get(from) || pc.signalingState !== 'stable');
+        if (offerCollision) {
+          if (!isPolite(from)) {
+            // We are impolite and already offering → ignore remote offer
+            return;
+          }
+          // We are polite → roll back our offer and accept theirs
+          try {
+            await pc.setLocalDescription({ type: 'rollback' });
+          } catch (e) {}
+          voiceMakingOffer.set(from, false);
         }
+
+        await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+        // Flush any ICE candidates that arrived early
+        if (pc._pendingIce && pc._pendingIce.length) {
+          for (const c of pc._pendingIce) {
+            try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch (e) {}
+          }
+          pc._pendingIce = [];
+        }
+
+        // Attach our mic if enabled
+        if (localStream && micEnabled) {
+          const audioTrack = localStream.getAudioTracks()[0];
+          if (audioTrack) {
+            const sender = pc.getSenders().find(s => s.track && s.track.kind === 'audio');
+            if (sender) {
+              await sender.replaceTrack(audioTrack).catch(() => {});
+            } else {
+              try { pc.addTrack(audioTrack, localStream); } catch (e) {}
+            }
+            pc.getTransceivers().forEach(t => {
+              if (t.receiver && t.receiver.track && t.receiver.track.kind === 'audio') {
+                try { t.direction = 'sendrecv'; } catch (e) {}
+              }
+            });
+          }
+        }
+
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
         sendSignal(from, { kind: 'answer', sdp: pc.localDescription });
       } else if (data.kind === 'answer') {
-        if (pc.signalingState !== 'stable') {
+        if (pc.signalingState === 'have-local-offer') {
           await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+          if (pc._pendingIce && pc._pendingIce.length) {
+            for (const c of pc._pendingIce) {
+              try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch (e) {}
+            }
+            pc._pendingIce = [];
+          }
         }
       } else if (data.kind === 'ice' && data.candidate) {
         try {
-          await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+          if (pc.remoteDescription) {
+            await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+          } else {
+            (pc._pendingIce || (pc._pendingIce = [])).push(data.candidate);
+          }
         } catch (e) {
-          // ignore late candidates
+          // ignore
+        }
+      } else if (data.kind === 'voice-ready') {
+        // Remote peer just enabled their mic — if we are the initiator, offer
+        if (micEnabled && localStream) {
+          maybeMakeOffer(from);
         }
       }
     } catch (err) {
-      console.warn('handleSignal error', from, err);
+      console.warn('handleSignal error', from, data && data.kind, err);
     }
   }
 
@@ -568,6 +682,7 @@
       try { pc.close(); } catch (e) {}
       voicePcs.delete(peerId);
     }
+    voiceMakingOffer.delete(peerId);
     voiceStreams.delete(peerId);
     const audio = document.getElementById('voice-audio-' + peerId);
     if (audio) {
@@ -590,20 +705,32 @@
 
   async function toggleMic() {
     if (voiceStarting) return;
+    unlockAudio(); // user gesture
+
     if (micEnabled) {
-      // Mute / stop sending
       micEnabled = false;
       if (localStream) {
         localStream.getAudioTracks().forEach(t => { t.enabled = false; });
       }
-      // Optionally fully stop tracks to release hardware:
-      // localStream.getTracks().forEach(t => t.stop()); localStream = null;
+      // Stop sending on all peer connections
+      for (const pc of voicePcs.values()) {
+        pc.getSenders().forEach(s => {
+          if (s.track && s.track.kind === 'audio') {
+            s.replaceTrack(null).catch(() => {});
+          }
+        });
+        pc.getTransceivers().forEach(t => {
+          if (t.receiver && t.receiver.track && t.receiver.track.kind === 'audio') {
+            try { t.direction = 'recvonly'; } catch (e) {}
+          }
+        });
+      }
       updateMicUI();
       showNotice('Microphone off');
       return;
     }
 
-    // Enable
+    // Enable mic
     voiceStarting = true;
     updateMicUI();
     const stream = await ensureLocalStream();
@@ -615,27 +742,30 @@
     micEnabled = true;
     stream.getAudioTracks().forEach(t => { t.enabled = true; });
 
-    // Attach to existing PCs or create new ones and offer
+    // For every known peer, either offer or prepare to answer
     for (const peerId of peers.keys()) {
-      let pc = voicePcs.get(peerId);
-      if (!pc) {
-        pc = createVoicePc(peerId);
-        // We are the initiator for peers we already know about
-        startCallWith(peerId, true);
-      } else {
-        // Add tracks if missing
-        stream.getTracks().forEach(track => {
-          const already = pc.getSenders().some(s => s.track && s.track.id === track.id);
-          if (!already) {
+      const pc = createVoicePc(peerId);
+      const track = stream.getAudioTracks()[0];
+      if (track) {
+        const sender = pc.getSenders().find(s => !s.track || s.track.kind === 'audio');
+        if (sender) {
+          sender.replaceTrack(track).catch(() => {
             try { pc.addTrack(track, stream); } catch (e) {}
-          } else {
-            // Re-enable
-            const sender = pc.getSenders().find(s => s.track && s.track.kind === 'audio');
-            if (sender && sender.track) sender.track.enabled = true;
+          });
+        } else {
+          try { pc.addTrack(track, stream); } catch (e) {}
+        }
+        pc.getTransceivers().forEach(t => {
+          if (t.receiver && t.receiver.track && t.receiver.track.kind === 'audio') {
+            try { t.direction = 'sendrecv'; } catch (e) {}
           }
         });
       }
+      maybeMakeOffer(peerId);
+      // Tell the other side we now have mic so they can offer if they are the initiator
+      sendSignal(peerId, { kind: 'voice-ready' });
     }
+
     updateMicUI();
     showNotice('Microphone on — others can hear you');
   }
@@ -723,9 +853,9 @@
       peers.set(data.id, p);
       if (announce) showNotice((p.name || 'A visitor') + ' entered the gallery');
       renderPresenceUI();
-      // If mic is already on, initiate voice with the new peer
+      // If mic is already on, set up voice with the new peer
       if (micEnabled && localStream) {
-        startCallWith(data.id, true);
+        maybeMakeOffer(data.id);
       }
       return;
     }
@@ -923,7 +1053,8 @@
         } else if (m.type === 'leave') {
           removePeer(m.id, true);
         } else if (m.type === 'signal') {
-          // Local BroadcastChannel signaling (same shape as WS)
+          // Only handle signals addressed to us
+          if (m.to && m.to !== self.id) return;
           handleSignal(m.from || m.id, m.data);
         }
       };
